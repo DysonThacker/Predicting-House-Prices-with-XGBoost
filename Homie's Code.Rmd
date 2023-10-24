@@ -8,8 +8,12 @@ output:
     toc_depth: 3
 ---
 
+
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+
+#https://www.kaggle.com/code/erikbruin/house-prices-lasso-xgboost-and-a-detailed-eda/report#header
 ```
 #Executive Summary
 
