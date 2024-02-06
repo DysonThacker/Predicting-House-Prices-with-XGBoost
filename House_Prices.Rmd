@@ -1,0 +1,1784 @@
+---
+title: "Predicting House Prices with XGBoost"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r, include=FALSE}
+setwd("/Users/dysonthacker/Documents/Job Stuff/Portfolio Projects/House Prices")
+```
+
+# Executive Summary
+
+In an effort to refresh my predictive modeling skills, I entered an ongoing Kaggle Competition where competitors attempt to predict house prices in Ames, Iowa.
+
+I started this competition by just focusing on getting a good understanding of the dataset. The EDA is detailed and many visualizations are included.
+
+Feature engineering was performed on a handful of variables, which greatly improved model performance.
+
+The XGBoost model ended up performing very well with a cross validation RMSE of 0.1177.
+
+# Introduction
+
+Kaggle describes this competition as [follows](https://www.kaggle.com/c/house-prices-advanced-regression-techniques):
+
+Ask a home buyer to describe their dream house, and they probably won't begin with the height of the basement ceiling or the proximity to an east-west railroad. But this playground competition's dataset proves that much more influences price negotiations than the number of bedrooms or a white-picket fence.
+
+With 79 explanatory variables describing (almost) every aspect of residential homes in Ames, Iowa, this competition challenges you to predict the final price of each home.
+
+# Loading data and Packages
+
+```{r, message = FALSE, warning = FALSE}
+# Read packages
+library(ggplot2)
+library(readr)
+library(dplyr)
+library(ggrepel)
+library(scales)
+library(knitr)
+library(corrplot)
+library(plyr)
+library(randomForest)
+library(gridExtra)
+library(psych)
+library(caret)
+library(xgboost)
+```
+
+```{r, message = FALSE}
+test <- read.csv("test.csv", stringsAsFactors = F)
+train <- read.csv("train.csv", stringsAsFactors = F)
+
+
+#Saving IDs in a vector for later
+test_labels <- test$Id
+test$Id <- NULL
+train$Id <- NULL
+
+test$SalePrice <- NA
+all <- rbind(train, test)
+```
+
+The dataset consists of characters and integers. Most of the character variables are actually factors, but I read them in as character strings because most of them require cleaning and/or feature engineering.
+
+# Categorizing data types
+
+```{r, message = FALSE}
+
+numericVars <- which(sapply(all, is.numeric)) #index vector numeric variables
+numericVarNames <- names(numericVars) #saving names vector for use later on
+
+##str(numericVarNames)
+##cat('There are', length(numericVars), 'numeric variables')
+
+```
+
+# Exploratory Data Analysis
+
+## SalePrice
+
+```{r, message=FALSE}
+ggplot(data=all[!is.na(all$SalePrice),], aes(x=SalePrice)) +
+        geom_histogram(fill="blue", binwidth = 10000) +
+        scale_x_continuous(breaks= seq(0, 800000, by = 100000), labels = comma)
+
+summary(all$SalePrice)
+```
+
+SalePrice is very right skewed. This was expected as very few people can afford very expensive houses. This will be kept in mind, and will be dealt with before modeling.
+
+## Most Important Numeric Predictors
+
+```{r}
+numeric.vars <- which(sapply(all, is.numeric)) #index vector numeric variables
+numeric.var.names <- names(numeric.vars) #saving names vector for use later on
+
+all.num.var <- all[, numeric.vars]
+cor.num.var <- cor(all.num.var, use="pairwise.complete.obs") #correlations of all numeric variables
+
+cor.sorted <- as.matrix(sort(cor.num.var[,'SalePrice'], decreasing = TRUE)) #sort on decreasing correlations with SalePrice
+
+#select only high corelations
+CorHigh <- names(which(apply(cor.sorted, 1, function(x) abs(x)>0.5)))
+cor.num.var <- cor.num.var[CorHigh, CorHigh]
+
+corrplot.mixed(cor.num.var, tl.col="black", tl.pos = "lt", number.cex=0.75)
+```
+
+The correlation plot shows that 10 variables have a correlation above 0.5 with SalePrice. We also see that there is some multicollinearity going on. GarageArea has a 0.89 correlation with GarageCars. X1stFlrSF has a 0.80 correlation with TotalBsmtSF. TotRmsAbvGrd has a 0.81 correlation with GrLivArea.
+
+## Overall Quality
+
+The variable Overall Quality has the highest correlation with SalePrice. Overall quality is defined as "The overall material and finish of the house," and provides a ranking between 1 through 10.
+
+```{r}
+ggplot(data=all[!is.na(all$SalePrice),], aes(x=factor(OverallQual), y=SalePrice))+
+        geom_boxplot(col='blue') + labs(x='Overall Quality') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+```
+
+As the Overall Quality of the house increases, Sale Price increases.
+
+## Above Ground Living Area
+
+```{r}
+ggplot(data=all[!is.na(all$SalePrice),], aes(x=GrLivArea, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+```
+
+# Factorization and fixing NA's
+
+## Completeness of the data
+
+First, let's check and see which variables have missing values.
+
+```{r}
+NAcol <- which(colSums(is.na(all)) > 0)
+sort(colSums(sapply(all[NAcol], is.na)), decreasing = TRUE)
+cat('There are', length(NAcol), 'columns with missing values')
+```
+
+The 1459 NAs in SalePrice match the size of the test set perfectly. This means that NA's need to be fixed in 34 predictor variables.
+
+## Imputing missing data and dealing with character variables {.tabset}
+
+Here I will take a look at the 34 variables that contain missing values. I will begin with the variables that has the most NA's and work my way down. If I come across a variable that actually forms a group with other variables, I will deal with them at the same time. For example, Pool, Garage and Basement all have more than one variable relating to the area.
+
+I decided to use knitr's "Tabs" ability to keep the document more readable. If you don't want to read every section, the Garage and Basement sections are especially interesting.
+
+Along with fixing NA's, I have also converted character variables into ordinal integers and factors. I will later convert the factors into numeric variables by creating dummy variables.
+
+### Pool Variables
+**Pool Quality and the PoolArea variable**
+
+PoolQC: Pool quality
+		
+       Ex	Excellent
+       Gd	Good
+       TA	Average/Typical
+       Fa	Fair
+       NA	No Pool
+       
+NA means No Pool. Easy enough. The high number of NA's makes sense as not many houses have pools.
+
+```{r}
+all$PoolQC[is.na(all$PoolQC)] <- 'None'
+```
+
+It is also clear that this variable ordinal and can be label encoded. Because there are multiple variables that use the same quality levels of 0-5, I am going to create a vector that I can reuse later on.
+
+```{r}
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+```
+
+Now, we can use the revalue function to assign a number to each string
+
+```{r, message=FALSE}
+
+all$PoolQC<-as.integer(revalue(all$PoolQC, Qualities))
+table(all$PoolQC)
+```
+Only ten houses have pools.
+
+However, there is a second variable that relates to Pools. This is the PoolArea variable (in square feet). There are 3 houses that have a PoolArea but no PoolQC. First, I checked if there was a clear relation between the PoolArea and the PoolQC. As I did not see a clear relation (bigger or smaller pools with better PoolQC), I am going to impute PoolQC values based on the Overall Quality of the houses (which is not very high for those 3 houses).
+
+```{r}
+all[all$PoolArea>0 & all$PoolQC==0, c('PoolArea', 'PoolQC', 'OverallQual')]
+
+all$PoolQC[2421] <- 2
+all$PoolQC[2504] <- 3
+all$PoolQC[2600] <- 2
+```
+
+**Please return to the Tabs menu to view work on other variables**
+
+
+### MiscFeature
+
+MiscFeature has 2814 NAs.
+
+MiscFeature: Miscellaneous feature not covered in other categories
+		
+       Elev	Elevator
+       Gar2	2nd Garage (if not described in garage section)
+       Othr	Other
+       Shed	Shed (over 100 SF)
+       TenC	Tennis Court
+       NA	None
+
+This is a clear case of a factor, where NA means None. 
+```{r}
+all$MiscFeature[is.na(all$MiscFeature)] <- 'None'
+all$MiscFeature <- as.factor(all$MiscFeature)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=MiscFeature, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+
+table(all$MiscFeature)
+```
+Interestingly, properties with large sheds sold for less money than properties with no extra features. Maybe having a shed means the property doesn't have a garage in many cases? And with there only being one house that has a tennis court, this variable isn't particularly useful.
+
+**Please return to the Tabs menu to view work on other variables**
+
+### Alley
+
+Alley: Type of alley access to property
+
+       Grvl	Gravel
+       Pave	Paved
+       NA 	No alley access
+
+Alley is a factor variable. Most houses do not have alleys.
+
+```{r}
+all$Alley[is.na(all$Alley)] <- 'None'
+all$Alley <- as.factor(all$Alley)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Alley, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+
+table(all$MiscFeature)
+
+```
+Ninety one properties are connected to an Alley, and, as expected, houses on paved alleys are worth more than houses on gravel.
+
+### Fence
+
+Fence: Fence quality
+		
+       GdPrv	Good Privacy
+       MnPrv	Minimum Privacy
+       GdWo	Good Wood
+       MnWw	Minimum Wood/Wire
+       NA	No Fence
+       
+This is a true factor fariable as the categories are not ordinal. It seems like this should've been two different variables, as two categories could be true at one time. A fence could have both good privacy and good wood.
+
+```{r}
+all$Fence[is.na(all$Fence)] <- 'None'
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Fence, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+
+all$Fence <- as.factor(all$Fence)
+```
+
+### FireplaceQu
+
+FireplaceQu: Fireplace quality
+
+       Ex	Excellent - Exceptional Masonry Fireplace
+       Gd	Good - Masonry Fireplace in main level
+       TA	Average - Prefabricated Fireplace in main living area or Masonry Fireplace in basement
+       Fa	Fair - Prefabricated Fireplace in basement
+       Po	Poor - Ben Franklin Stove
+       NA	No Fireplace
+       
+Ordinal factor regarding the quality of the property's fireplace.
+
+```{r}
+all$FireplaceQu[is.na(all$FireplaceQu)] <- 'None'
+all$FireplaceQu<-as.integer(revalue(all$FireplaceQu, Qualities))
+table(all$FireplaceQu)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=FireplaceQu, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+Having no fireplace is slightly better than having a low quality fireplace. The properties with the highest quality fireplaces have incredible value, more than $100,000 higher than the next level of fireplace quality.
+
+
+### Lot Variables
+
+There are three variables related to lots. LotFrontage has NAs and LotShape and LotConfig are complete.
+
+LotFrontage: Linear feet of street connected to property
+
+There are almost 500 NAs. It is unreasonale for a house to have 0 feet of street property, and these values need to be imputed. I am going to impute these values by taking the median value of other houses in the same neighborhood.
+
+```{r}
+ggplot(all[!is.na(all$LotFrontage),], aes(x=as.factor(Neighborhood), y=LotFrontage)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+for (i in 1:nrow(all)){
+        if(is.na(all$LotFrontage[i])){
+               all$LotFrontage[i] <- as.integer(median(all$LotFrontage[all$Neighborhood==all$Neighborhood[i]], na.rm=TRUE)) 
+        }
+}
+```
+
+LotShape: General shape of property
+
+       Reg	Regular	
+       IR1	Slightly irregular
+       IR2	Moderately Irregular
+       IR3	Irregular
+       
+No NAs. The values seem ordinal.
+
+```{r}
+all$LotShape<-as.integer(revalue(all$LotShape, c('IR3'=0, 'IR2'=1, 'IR1'=2, 'Reg'=3)))
+table(all$LotShape)
+sum(table(all$LotShape))
+```
+
+LotConfig: Lot configuration
+
+       Inside	Inside lot
+       Corner	Corner lot
+       CulDSac	Cul-de-sac
+       FR2	Frontage on 2 sides of property
+       FR3	Frontage on 3 sides of property
+       
+No NAs. The values are not ordinal so I converted the variable to a factor.
+```{r}
+all$LotConfig <- as.factor(all$LotConfig)
+table(all$LotConfig)
+sum(table(all$LotConfig))
+```
+       
+
+
+### Garages
+There are 7 garage variables: GarageYrBlt, GarageFinish, GarageQual, GarageCond, GarageType, GarageCars, and GarageArea.
+
+Two of those have one NA (GarageCars and GarageArea), one has 157 NAs (GarageType), and the other four have 159 NAs.
+
+I am going to replace all NAs with the year the house was built.
+
+```{r}
+all$GarageYrBlt[is.na(all$GarageYrBlt)] <- all$YearBuilt[is.na(all$GarageYrBlt)]
+```
+
+As NAs mean 'No Garage' for character variables, I now want to find out where the differences between the 157 NA GarageType and the other 3 character variables with 159 NAs come from.
+
+```{r}
+#check if all 157 NAs are the same observations among the variables with 157/159 NAs
+length(which(is.na(all$GarageType) & is.na(all$GarageFinish) & is.na(all$GarageCond) & is.na(all$GarageQual)))
+
+#Find the 2 additional NAs
+kable(all[!is.na(all$GarageType) & is.na(all$GarageFinish), c('GarageCars', 'GarageArea', 'GarageType', 'GarageCond', 'GarageQual', 'GarageFinish')])
+```
+The 157 NAs within GarageType all turn out to be NA in GarageCondition, GarageQuality, and GarageFinish as well. The differences are found in houses 2127 and 2577. As you can see, house 2127 actually does seem to have a Garage and house 2577 does not. Therefore, there should be 158 houses without a Garage. To fix house 2127, I will impute the most common values for GarageCond, GarageQual, and GarageFinish.
+
+```{r}
+#Imputing modes.
+all$GarageCond[2127] <- names(sort(-table(all$GarageCond)))[1]
+all$GarageQual[2127] <- names(sort(-table(all$GarageQual)))[1]
+all$GarageFinish[2127] <- names(sort(-table(all$GarageFinish)))[1]
+
+#display "fixed" house
+kable(all[2127, c('GarageYrBlt', 'GarageCars', 'GarageArea', 'GarageType', 'GarageCond', 'GarageQual', 'GarageFinish')])
+```
+
+**GarageCars and GarageArea: The number of cars that can fit in the garage and the area in Square Feet**
+
+
+Both have 1 NA. As you can see above, it is house 2577 for both variables. The problem probably occured as the GarageType for this house is "detached", while all other Garage-variables seem to indicate that this house has no Garage.
+
+```{r}
+#fixing 3 values for house 2577
+all$GarageCars[2577] <- 0
+all$GarageArea[2577] <- 0
+all$GarageType[2577] <- NA
+
+#check if NAs of the character variables are now all 158
+length(which(is.na(all$GarageType) & is.na(all$GarageFinish) & is.na(all$GarageCond) & is.na(all$GarageQual)))
+```
+
+Now, the 4 character variables related to garage all have the same set of 158 NAs, which correspond to 'No Garage'. I will fix all of them in the remainder of this section
+
+**GarageType: Garage location**
+
+The values do not seem ordinal, so I will convert into a factor.
+
+       2Types	More than one type of garage
+       Attchd	Attached to home
+       Basment	Basement Garage
+       BuiltIn	Built-In (Garage part of house - typically has room above garage)
+       CarPort	Car Port
+       Detchd	Detached from home
+       NA	No Garage
+
+```{r}
+all$GarageType[is.na(all$GarageType)] <- 'No Garage'
+all$GarageType <- as.factor(all$GarageType)
+table(all$GarageType)
+```
+
+**GarageFinish: Interior finish of the garage**
+
+GarageFinish: Interior finish of the garage
+
+       Fin	Finished
+       RFn	Rough Finished	
+       Unf	Unfinished
+       NA	No Garage
+
+These values are ordinal.
+
+```{r}
+all$GarageFinish[is.na(all$GarageFinish)] <- 'NA'
+all$GarageFinish<-as.integer(revalue(all$GarageFinish, c('NA'=0, 'Unf'=1, 'RFn'=2, 'Fin'=3)))
+table(all$GarageFinish)
+sum(table(all$GarageFinish))
+
+ggplot(all[!is.na(all$GarageFinish),], aes(x=GarageFinish, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+Houses with no garages are worth more than houses with unfinished garages.
+
+**GarageQual: Garage quality**
+
+GarageQual: Garage quality
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical/Average
+       Fa	Fair
+       Po	Poor
+       NA	No Garage
+
+Ordinal.
+
+```{r}
+all$GarageQual[is.na(all$GarageQual)] <- 'None'
+all$GarageQual<-as.integer(revalue(all$GarageQual, Qualities))
+table(all$GarageQual)
+
+ggplot(all, aes(x=GarageQual, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+
+```
+Only three garages received a top rating of Excellent, and the houses are not very valuable.
+
+**GarageCond: Garage condition**
+
+GarageCond: Garage condition
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical/Average
+       Fa	Fair
+       Po	Poor
+       NA	No Garage
+       
+Ordinal. This variable looks to be almost the same as GarageQual. The data dictionary does not mention any distinction.
+
+```{r}
+all$GarageCond[is.na(all$GarageCond)] <- 'None'
+all$GarageCond<-as.integer(revalue(all$GarageCond, Qualities))
+table(all$GarageCond)
+
+ggplot(all, aes(x=GarageCond, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+
+
+
+
+### Basements
+
+There are 11 variables that related to the basement of the house. Five of them have 79-82 NAs, and six have one NA each.
+
+```{r}
+#check if all 79 NAs are the same observations among the variables with 80+ NAs
+length(which(is.na(all$BsmtQual) & is.na(all$BsmtCond) & is.na(all$BsmtExposure) & is.na(all$BsmtFinType1) & is.na(all$BsmtFinType2)))
+
+#Find the additional NAs; BsmtFinType1 is the one with 79 NAs
+all[!is.na(all$BsmtFinType1) & (is.na(all$BsmtCond)|is.na(all$BsmtQual)|is.na(all$BsmtExposure)|is.na(all$BsmtFinType2)), c('BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2')]
+```
+
+So altogether, it seems as if there are 79 houses without a basement, because the basement variables of the other houses with missing values are all 80% complete (missing 1 out of 5 values). I am going to impute the modes to fix the other 9 houses that only have one NA value each.
+
+```{r}
+#Imputing modes.
+all$BsmtFinType2[333] <- names(sort(-table(all$BsmtFinType2)))[1]
+all$BsmtExposure[c(949, 1488, 2349)] <- names(sort(-table(all$BsmtExposure)))[1]
+all$BsmtCond[c(2041, 2186, 2525)] <- names(sort(-table(all$BsmtCond)))[1]
+all$BsmtQual[c(2218, 2219)] <- names(sort(-table(all$BsmtQual)))[1]
+```
+
+Now that the 5 variables considered agree upon 79 houses with 'no basement', I am going to factorize/hot encode them below.
+
+BsmtQual: Evaluates the height of the basement
+
+       Ex	Excellent (100+ inches)	
+       Gd	Good (90-99 inches)
+       TA	Typical (80-89 inches)
+       Fa	Fair (70-79 inches)
+       Po	Poor (<70 inches
+       NA	No Basement
+
+An ordinal variable so we can make use of the Qualities vector.
+
+```{r, message=FALSE}
+all$BsmtQual[is.na(all$BsmtQual)] <- 'None'
+all$BsmtQual<-as.integer(revalue(all$BsmtQual, Qualities))
+table(all$BsmtQual)
+```
+		
+**BsmtCond: Evaluates the general condition of the basement**
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical - slight dampness allowed
+       Fa	Fair - dampness or some cracking or settling
+       Po	Poor - Severe cracking, settling, or wetness
+       NA	No Basement
+
+An ordinal variable so we can make use of the Qualities vector.
+
+```{r, message=FALSE}
+all$BsmtCond[is.na(all$BsmtCond)] <- 'None'
+all$BsmtCond<-as.integer(revalue(all$BsmtCond, Qualities))
+table(all$BsmtCond)
+```
+	
+**BsmtExposure: Refers to walkout or garden level walls**
+
+       Gd	Good Exposure
+       Av	Average Exposure (split levels or foyers typically score average or above)	
+       Mn	Mimimum Exposure
+       No	No Exposure
+       NA	No Basement
+       
+An ordinal variable.
+
+```{r}
+all$BsmtExposure[is.na(all$BsmtExposure)] <- 'None'
+Exposure <- c('None'=0, 'No'=1, 'Mn'=2, 'Av'=3, 'Gd'=4)
+
+all$BsmtExposure<-as.integer(revalue(all$BsmtExposure, Exposure))
+table(all$BsmtExposure)
+```
+       
+**BsmtFinType1: Rating of basement finished area**
+
+       GLQ	Good Living Quarters
+       ALQ	Average Living Quarters
+       BLQ	Below Average Living Quarters	
+       Rec	Average Rec Room
+       LwQ	Low Quality
+       Unf	Unfinshed
+       NA	No Basement
+       
+Another ordinal variable.
+		
+```{r}
+all$BsmtFinType1[is.na(all$BsmtFinType1)] <- 'None'
+FinType <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+
+all$BsmtFinType1<-as.integer(revalue(all$BsmtFinType1, FinType))
+table(all$BsmtFinType1)
+```
+
+**BsmtFinType2: Rating of basement finished area (if multiple types)**
+
+       GLQ	Good Living Quarters
+       ALQ	Average Living Quarters
+       BLQ	Below Average Living Quarters	
+       Rec	Average Rec Room
+       LwQ	Low Quality
+       Unf	Unfinshed
+       NA	No Basement
+       
+Another ordinal variable.
+
+```{r}
+all$BsmtFinType2[is.na(all$BsmtFinType2)] <- 'None'
+FinType <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+
+all$BsmtFinType2<-as.integer(revalue(all$BsmtFinType2, FinType))
+table(all$BsmtFinType2)
+```
+
+**Remaining Basement variabes with just a few NAs**
+
+I now still have to deal with those 6 variables that have 1 or 2 NAs.
+
+```{r}
+#display remaining NAs. Using BsmtQual as a reference for the 79 houses without basement agreed upon earlier
+all[(is.na(all$BsmtFullBath)|is.na(all$BsmtHalfBath)|is.na(all$BsmtFinSF1)|is.na(all$BsmtFinSF2)|is.na(all$BsmtUnfSF)|is.na(all$TotalBsmtSF)), c('BsmtQual', 'BsmtFullBath', 'BsmtHalfBath', 'BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF', 'TotalBsmtSF')]
+```
+
+It should be obvious that those remaining NAs all refer to 'not present'. Below, I am fixing those remaining variables.
+
+**BsmtFullBath: Basement full bathrooms**
+
+An integer variable.
+```{r}
+all$BsmtFullBath[is.na(all$BsmtFullBath)] <-0
+table(all$BsmtFullBath)
+```
+
+**BsmtHalfBath: Basement half bathrooms**
+
+An integer variable.
+```{r}
+all$BsmtHalfBath[is.na(all$BsmtHalfBath)] <-0
+table(all$BsmtHalfBath)
+```
+
+**BsmtFinSF1: Type 1 finished square feet**
+
+An integer variable.
+```{r}
+all$BsmtFinSF1[is.na(all$BsmtFinSF1)] <-0
+```
+
+**BsmtFinSF2: Type 2 finished square feet**
+
+An integer variable.
+```{r}
+all$BsmtFinSF2[is.na(all$BsmtFinSF2)] <-0
+```
+
+**BsmtUnfSF: Unfinished square feet of basement area**
+
+An integer variable.
+```{r}
+all$BsmtUnfSF[is.na(all$BsmtUnfSF)] <-0
+```
+
+**TotalBsmtSF: Total square feet of basement area**
+
+An integer variable.
+```{r}
+all$TotalBsmtSF[is.na(all$TotalBsmtSF)] <-0
+```
+
+
+
+### Masonry Veneer
+
+MasVnrType has 24 NAs and MasVnrArea has 23 NAs.
+
+```{r}
+length(which(is.na(all$MasVnrType) & is.na(all$MasVnrArea)))
+```
+All 23 of MasVnrArea have NAs. I will deal with these first and then look into the one leftover MasVnrType.
+
+MasVnrArea: Masonry veneer area in square feet
+
+An NA in MasVnrArea implies that the house just doesn't have a masonry veneer. I will impute the missing values with zero.
+
+```{r}
+all$MasVnrArea[is.na(all$MasVnrArea)] <- 0
+```
+
+
+MasVnrType: Masonry veneer type
+
+       BrkCmn	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       None	None
+       Stone	Stone
+
+Not ordinal. Will convert into factor.
+
+But first, let's find the house that has a veneer area but no veneer type.
+```{r}
+kable(all[all$MasVnrArea != 0 & is.na(all$MasVnrType), c('MasVnrArea', 'MasVnrType')])
+```
+Since we have no way of knowing which type of masonry this house had, let's impute with the most common.
+
+```{r}
+all$MasVnrType[2611] <- names(sort(-table(all$MasVnrType)))[2] #taking the 2nd value as the 1st is 'none'
+```
+
+Because MasVnrType is not ordinal it can be converted into a factor.
+
+```{r}
+all$MasVnrType[is.na(all$MasVnrType)] <- 'None'
+table(all$MasVnrType)
+all$MasVnrType <- as.factor(all$MasVnrType)
+
+ggplot(all, aes(x=MasVnrType, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+### MSZoning
+
+MSZoning: Identifies the general zoning classification of the sale.
+
+       A	Agriculture
+       C	Commercial
+       FV	Floating Village Residential
+       I	Industrial
+       RH	Residential High Density
+       RL	Residential Low Density
+       RP	Residential Low Density Park 
+       RM	Residential Medium Density
+
+A factor variable which has four NAs.
+
+```{r}
+#imputing the mode
+all$MSZoning[is.na(all$MSZoning)] <- names(sort(-table(all$MSZoning)))[1]
+all$MSZoning <- as.factor(all$MSZoning)
+table(all$MSZoning)
+sum(table(all$MSZoning))
+```
+
+
+### Utilities
+
+Utilities: Type of utilities available
+		
+       AllPub	All public Utilities (E,G,W,& S)	
+       NoSewr	Electricity, Gas, and Water (Septic Tank)
+       NoSeWa	Electricity and Gas Only
+       ELO	Electricity only
+
+Factor variable with two NAs.
+
+```{r}
+#imputing the mode
+all$Utilities[is.na(all$Utilities)] <- names(sort(-table(all$Utilities)))[1]
+all$Utilities <- as.factor(all$Utilities)
+table(all$Utilities)
+sum(table(all$Utilities))
+```
+All houses but one have all public utilities. 
+
+
+### Functional 
+
+Functional: Home functionality (Assume typical unless deductions are warranted)
+
+       Typ	Typical Functionality
+       Min1	Minor Deductions 1
+       Min2	Minor Deductions 2
+       Mod	Moderate Deductions
+       Maj1	Major Deductions 1
+       Maj2	Major Deductions 2
+       Sev	Severely Damaged
+       Sal	Salvage only
+       
+An ordinal factor with two NAs.
+
+I will impute the NAs with the most common functionality, Typ.
+
+```{r}
+all$Functional[is.na(all$Functional)]<-names(sort(-table(all$Functional)))[1]
+functional <- c('Sal'=0, 'Sev'=1, 'Maj2'=2, 'Maj1'=3, 'Mod'=4, 'Min2'=5, 'Min1'=6, 'Typ'=7)
+all$Functional <- as.integer(revalue(all$Functional, functional))
+table(all$Functional)
+sum(table(all$Functional))
+```
+
+
+### Exterior Variables
+
+**Exterior1st**
+
+Exterior1st: Exterior covering on house
+
+       AsbShng	Asbestos Shingles
+       AsphShn	Asphalt Shingles
+       BrkComm	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       CemntBd	Cement Board
+       HdBoard	Hard Board
+       ImStucc	Imitation Stucco
+       MetalSd	Metal Siding
+       Other	Other
+       Plywood	Plywood
+       PreCast	PreCast	
+       Stone	Stone
+       Stucco	Stucco
+       VinylSd	Vinyl Siding
+       Wd Sdng	Wood Siding
+       WdShing	Wood Shingles
+
+
+**Exterior2nd**
+
+Exterior2nd: Exterior covering on house (if more than one material)
+
+       AsbShng	Asbestos Shingles
+       AsphShn	Asphalt Shingles
+       BrkComm	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       CemntBd	Cement Board
+       HdBoard	Hard Board
+       ImStucc	Imitation Stucco
+       MetalSd	Metal Siding
+       Other	Other
+       Plywood	Plywood
+       PreCast	PreCast
+       Stone	Stone
+       Stucco	Stucco
+       VinylSd	Vinyl Siding
+       Wd Sdng	Wood Siding
+       WdShing	Wood Shingles
+       
+Both variables are factor variables with only one NA. I will simply impute with the mode.
+
+```{r}
+#1st
+all$Exterior1st[is.na(all$Exterior1st)]<-names(sort(-table(all$Exterior1st)))[1]
+table(all$Exterior1st)
+sum(table(all$Exterior1st))
+
+#2nd
+all$Exterior2nd[is.na(all$Exterior2nd)]<-names(sort(-table(all$Exterior2nd)))[1]
+table(all$Exterior2nd)
+sum(table(all$Exterior2nd))
+```
+
+
+### Electrical
+
+Electrical: Electrical system
+
+       SBrkr	Standard Circuit Breakers & Romex
+       FuseA	Fuse Box over 60 AMP and all Romex wiring (Average)	
+       FuseF	60 AMP Fuse Box and mostly Romex wiring (Fair)
+       FuseP	60 AMP Fuse Box and mostly knob & tube wiring (poor)
+       Mix	Mixed
+
+Almost ordinal, but the mixed option throws it off. Only one NA so I will impute the mode.    
+```{r}
+all$Electrical[is.na(all$Electrical)]<-names(sort(-table(all$Electrical)))[1]
+all$Electrical<-as.factor(all$Electrical)
+table(all$Electrical)
+sum(table(all$Electrical))
+```
+
+
+### KitchenQual
+
+KitchenQual: Kitchen quality
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical/Average
+       Fa	Fair
+       Po	Poor
+
+One NA. Will impute with the mode. Ordinal so we can use the qualities vector.
+
+```{r}
+all$KitchenQual[is.na(all$KitchenQual)]<-names(sort(-table(all$KitchenQual)))[1]
+all$KitchenQual<-as.integer(revalue(all$KitchenQual, Qualities))
+table(all$KitchenQual)
+sum(table(all$KitchenQual))
+```
+
+### SaleType 
+
+SaleType: Type of sale
+		
+       WD 	Warranty Deed - Conventional
+       CWD	Warranty Deed - Cash
+       VWD	Warranty Deed - VA Loan
+       New	Home just constructed and sold
+       COD	Court Officer Deed/Estate
+       Con	Contract 15% Down payment regular terms
+       ConLw	Contract Low Down payment and low interest
+       ConLI	Contract Low Interest
+       ConLD	Contract Low Down
+       Oth	Other
+       
+Factor variable with one NA. I will impute with the mode.
+```{r}
+all$SaleType[is.na(all$SaleType)]<-names(sort(-table(all$SaleType)))[1]
+all$SaleType<-as.factor(all$SaleType)
+table(all$SaleType)
+sum(table(all$SaleType))
+```
+
+### NA Check
+
+I will run one final check to make sure we have fixed all NA variables.
+```{r}
+NAcol <- which(colSums(is.na(all)) > 0)
+sort(colSums(sapply(all[NAcol], is.na)), decreasing = TRUE)
+```
+
+Now the only column with missing values is SalePrice, which we will be predicting.
+
+## Categorizing the remaining characted variables {.tabset}
+
+Now that all of the NAs have been addressed, a few variables are still improperly categorized. Character variables need to be changed to factors or ordinal factors and a few numeric variables are actually factors as well. I'll fix the character variables now. Similar to the NA section I have created a Tabset section that you can flip through.
+
+```{r}
+Charcol <- names(all[,sapply(all, is.character)])
+Charcol
+cat('There are', length(Charcol), 'remaining columns with character values')
+```
+
+### Street and Driveway
+**Street**
+Street: Type of road access to property
+
+       Grvl	Gravel	
+       Pave	Paved
+
+Ordinal factor.
+
+```{r}
+all$Street <- as.integer(revalue(all$Street, c('Grvl'=0, 'Pave'=1)))
+table(all$Street)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Street, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+**PavedDrive**
+PavedDrive: Paved driveway
+
+       Y	Paved 
+       P	Partial Pavement
+       N	Dirt/Gravel
+
+Ordinal Factor.
+
+```{r}
+all$PavedDrive <- as.integer(revalue(all$PavedDrive, c('N'=0, 'P'=1, 'Y'=2)))
+table(all$PavedDrive)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=PavedDrive, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+### Land
+**LandContour**
+LandContour: Flatness of the property
+
+       Lvl	Near Flat/Level	
+       Bnk	Banked - Quick and significant rise from street grade to building
+       HLS	Hillside - Significant slope from side to side
+       Low	Depression
+       
+Factor. I checked for ordinality but level properties are actually worth less than hillside and depression.
+```{r}
+all$LandContour <- as.factor(all$LandContour)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=LandContour, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+**LandSlope**
+LandSlope: Slope of property
+		
+       Gtl	Gentle slope
+       Mod	Moderate Slope	
+       Sev	Severe Slope
+
+Factor.
+```{r}
+all$LandSlope <- as.factor(all$LandSlope)
+table(all$LandSlope)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=LandSlope, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+### Neighborhood
+Neighborhood: Physical locations within Ames city limits
+
+       Blmngtn	Bloomington Heights
+       Blueste	Bluestem
+       BrDale	Briardale
+       BrkSide	Brookside
+       ClearCr	Clear Creek
+       CollgCr	College Creek
+       Crawfor	Crawford
+       Edwards	Edwards
+       Gilbert	Gilbert
+       IDOTRR	Iowa DOT and Rail Road
+       MeadowV	Meadow Village
+       Mitchel	Mitchell
+       Names	North Ames
+       NoRidge	Northridge
+       NPkVill	Northpark Villa
+       NridgHt	Northridge Heights
+       NWAmes	Northwest Ames
+       OldTown	Old Town
+       SWISU	South & West of Iowa State University
+       Sawyer	Sawyer
+       SawyerW	Sawyer West
+       Somerst	Somerset
+       StoneBr	Stone Brook
+       Timber	Timberland
+       Veenker	Veenker
+       
+Factor.
+```{r}
+all$Neighborhood <- as.factor(all$Neighborhood)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Neighborhood, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..)) +
+        theme(axis.text.x = element_text(angle = -50, hjust = 0))
+```
+
+### Conditions
+**Condition1**
+Condition1: Proximity to various conditions
+	
+       Artery	Adjacent to arterial street
+       Feedr	Adjacent to feeder street	
+       Norm	Normal	
+       RRNn	Within 200' of North-South Railroad
+       RRAn	Adjacent to North-South Railroad
+       PosN	Near positive off-site feature--park, greenbelt, etc.
+       PosA	Adjacent to postive off-site feature
+       RRNe	Within 200' of East-West Railroad
+       RRAe	Adjacent to East-West Railroad
+
+Factor.       
+```{r}
+all$Condition1 <- as.factor(all$Condition1)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Condition1, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..)) +
+        theme(axis.text.x = element_text(angle = -40, hjust = 0))
+```
+       
+       
+**Condition2**
+Condition2: Proximity to various conditions (if more than one is present)
+		
+       Artery	Adjacent to arterial street
+       Feedr	Adjacent to feeder street	
+       Norm	Normal	
+       RRNn	Within 200' of North-South Railroad
+       RRAn	Adjacent to North-South Railroad
+       PosN	Near positive off-site feature--park, greenbelt, etc.
+       PosA	Adjacent to postive off-site feature
+       RRNe	Within 200' of East-West Railroad
+       RRAe	Adjacent to East-West Railroad
+
+```{r}
+all$Condition2 <- as.factor(all$Condition2)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Condition2, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+### BldgType
+BldgType: Type of dwelling
+		
+       1Fam	Single-family Detached	
+       2FmCon	Two-family Conversion; originally built as one-family dwelling
+       Duplx	Duplex
+       TwnhsE	Townhouse End Unit
+       TwnhsI	Townhouse Inside Unit
+Factor.
+```{r}
+all$BldgType <- as.factor(all$BldgType)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=BldgType, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+### House and Roof Style
+**HouseStyle**
+       1Story	One story
+       1.5Fin	One and one-half story: 2nd level finished
+       1.5Unf	One and one-half story: 2nd level unfinished
+       2Story	Two story
+       2.5Fin	Two and one-half story: 2nd level finished
+       2.5Unf	Two and one-half story: 2nd level unfinished
+       SFoyer	Split Foyer
+       SLvl	Split Level
+Factor
+```{r}
+all$HouseStyle <- as.factor(all$HouseStyle)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=HouseStyle, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+**RoofStyle**
+RoofStyle: Type of roof
+
+       Flat	Flat
+       Gable	Gable
+       Gambrel	Gambrel (Barn)
+       Hip	Hip
+       Mansard	Mansard
+       Shed	Shed
+Factor.
+```{r}
+all$RoofStyle <- as.factor(all$RoofStyle)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=RoofStyle, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+**RoofMatl**
+RoofMatl: Roof material
+
+       ClyTile	Clay or Tile
+       CompShg	Standard (Composite) Shingle
+       Membran	Membrane
+       Metal	Metal
+       Roll	Roll
+       Tar&Grv	Gravel & Tar
+       WdShake	Wood Shakes
+       WdShngl	Wood Shingles
+Factor.
+```{r}
+all$RoofMatl <- as.factor(all$RoofMatl)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=RoofMatl, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+
+### Exterior
+**Exterior1st**
+Exterior1st: Exterior covering on house
+
+       AsbShng	Asbestos Shingles
+       AsphShn	Asphalt Shingles
+       BrkComm	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       CemntBd	Cement Board
+       HdBoard	Hard Board
+       ImStucc	Imitation Stucco
+       MetalSd	Metal Siding
+       Other	Other
+       Plywood	Plywood
+       PreCast	PreCast	
+       Stone	Stone
+       Stucco	Stucco
+       VinylSd	Vinyl Siding
+       Wd Sdng	Wood Siding
+       WdShing	Wood Shingles
+Factor.
+```{r}
+all$Exterior1st <- as.factor(all$Exterior1st)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Exterior1st, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..)) +
+        theme(axis.text.x = element_text(angle = -40, hjust = 0))
+```
+
+**Exterior2nd**
+Exterior2nd: Exterior covering on house (if more than one material)
+
+       AsbShng	Asbestos Shingles
+       AsphShn	Asphalt Shingles
+       BrkComm	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       CemntBd	Cement Board
+       HdBoard	Hard Board
+       ImStucc	Imitation Stucco
+       MetalSd	Metal Siding
+       Other	Other
+       Plywood	Plywood
+       PreCast	PreCast
+       Stone	Stone
+       Stucco	Stucco
+       VinylSd	Vinyl Siding
+       Wd Sdng	Wood Siding
+       WdShing	Wood Shingles
+Factor.
+```{r}
+all$Exterior2nd <- as.factor(all$Exterior2nd)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Exterior2nd, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..)) +
+        theme(axis.text.x = element_text(angle = -40, hjust = 0))
+```
+
+**ExterQual**
+ExterQual: Evaluates the quality of the material on the exterior 
+		
+       Ex	Excellent
+       Gd	Good
+       TA	Average/Typical
+       Fa	Fair
+       Po	Poor
+Ordinal Factor.
+```{r}
+all$ExterQual<-as.integer(revalue(all$ExterQual, Qualities))
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=ExterQual, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+**ExterCond**
+ExterCond: Evaluates the present condition of the material on the exterior
+		
+       Ex	Excellent
+       Gd	Good
+       TA	Average/Typical
+       Fa	Fair
+       Po	Poor
+Ordinal Factor.
+```{r}
+all$ExterCond<-as.integer(revalue(all$ExterCond, Qualities))
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=ExterCond, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+### Foundation
+Foundation: Type of foundation
+		
+       BrkTil	Brick & Tile
+       CBlock	Cinder Block
+       PConc	Poured Contrete	
+       Slab	Slab
+       Stone	Stone
+       Wood	Wood
+Factor.
+```{r}
+all$Foundation <- as.factor(all$Foundation)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Foundation, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+
+### Heating and Air
+**Heating**
+Heating: Type of heating
+		
+       Floor	Floor Furnace
+       GasA	Gas forced warm air furnace
+       GasW	Gas hot water or steam heat
+       Grav	Gravity furnace	
+       OthW	Hot water or steam heat other than gas
+       Wall	Wall furnace
+Factor.
+```{r}
+all$Heating <- as.factor(all$Heating)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=Heating, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+**HeatingQC**
+HeatingQC: Heating quality and condition
+
+       Ex	Excellent
+       Gd	Good
+       TA	Average/Typical
+       Fa	Fair
+       Po	Poor
+Ordinal Factor.
+```{r}
+all$HeatingQC<-as.integer(revalue(all$HeatingQC, Qualities))
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=HeatingQC, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+**CentralAir**
+CentralAir: Central air conditioning
+
+       N	No
+       Y	Yes
+Ordinal Factor.
+```{r}
+all$CentralAir<-as.integer(revalue(all$CentralAir, c('N'=0,'Y'=1)))
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=CentralAir, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+
+### SaleCondition
+SaleCondition: Condition of sale
+
+       Normal	Normal Sale
+       Abnorml	Abnormal Sale -  trade, foreclosure, short sale
+       AdjLand	Adjoining Land Purchase
+       Alloca	Allocation - two linked properties with separate deeds, typically condo with a garage unit	
+       Family	Sale between family members
+       Partial	Home was not completed when last assessed (associated with New Homes)
+Factor.
+```{r}
+all$SaleCondition <- as.factor(all$SaleCondition)
+
+ggplot(all[!is.na(all$SalePrice),], aes(x=SaleCondition, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+### Double check character variables
+```{r}
+Charcol <- names(all[,sapply(all, is.character)])
+Charcol
+cat('There are', length(Charcol), 'remaining columns with character values')
+```
+
+## Numeric Factors
+
+A few variables that seem to be numeric at first glance are actually factors or ordinal factors. Let's fix that.
+
+```{r}
+Numcol <- names(all[,sapply(all, is.numeric)])
+Numcol
+```
+### MoSold: Month Sold (MM)
+
+The month a house is sold is a factor. Houses do not get more expensive in December (month 12) compared to January (month 1), or vice versa.
+```{r}
+all$MoSold <- as.factor(all$MoSold)
+
+ggplot(all[!is.na(all$MoSold),], aes(x=MoSold, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+### YrSold: Year Sold (YYYY)
+
+Same situation for year sold. Factor. Generally, house prices go up, but the relationship is not completely clear. As this dataset only contains houses sold within a time span of five years which also includes a major financial crisis, factor makes the most sence in this scenario.
+```{r}
+all$YrSold <- as.factor(all$YrSold)
+
+ggplot(all[!is.na(all$YrSold),], aes(x=YrSold, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+### MSSubClass: Identifies the type of dwelling involved in the sale.	
+
+        20	1-STORY 1946 & NEWER ALL STYLES
+        30	1-STORY 1945 & OLDER
+        40	1-STORY W/FINISHED ATTIC ALL AGES
+        45	1-1/2 STORY - UNFINISHED ALL AGES
+        50	1-1/2 STORY FINISHED ALL AGES
+        60	2-STORY 1946 & NEWER
+        70	2-STORY 1945 & OLDER
+        75	2-1/2 STORY ALL AGES
+        80	SPLIT OR MULTI-LEVEL
+        85	SPLIT FOYER
+        90	DUPLEX - ALL STYLES AND AGES
+       120	1-STORY PUD (Planned Unit Development) - 1946 & NEWER
+       150	1-1/2 STORY PUD - ALL AGES
+       160	2-STORY PUD - 1946 & NEWER
+       180	PUD - MULTILEVEL - INCL SPLIT LEV/FOYER
+       190	2 FAMILY CONVERSION - ALL STYLES AND AGES
+       
+MSSubClass is coded with a number but is really a factor.
+```{r}
+all$MSSubClass <- as.factor(all$MSSubClass)
+
+ggplot(all[!is.na(all$MSSubClass),], aes(x=MSSubClass, y=SalePrice)) +
+        geom_bar(stat='summary', fun=median, fill='blue') +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+# Feature Engineering
+
+## Bathrooms
+
+There are four bathroom variables. By themselves they are not very predictive but I suspect if they were combined they could add value.
+
+There are full baths and half baths. I created a Total Bathrooms variable which adds the number of bathrooms together, with half baths receiving a value of 0.5 and full baths receiving a value of 1.0. 
+
+BsmtFullBath, BsmtHalfBath, FullBath, HalfBath
+
+```{r}
+all$TotalBathrooms <- all$BsmtFullBath + all$BsmtHalfBath*(0.5) + all$FullBath + all$HalfBath*(0.5)
+```
+
+```{r, warning=FALSE}
+tb1 <- ggplot(data=all[!is.na(all$SalePrice),], aes(x=as.factor(TotalBathrooms), y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+tb2 <- ggplot(data=all, aes(x=as.factor(TotalBathrooms))) +
+        geom_histogram(stat='count')
+grid.arrange(tb1, tb2)
+```
+
+## House Age
+
+Let's create a variable for how old the house is at the time of sale. We could simply subtract YearBuilt from YrSold, but I would like to incorporate when houses have been remodeled. If a house is remodeled, then I set HouseAge equal to YrSold - YearRemodAdd and if the house was not remodeled then I set HouseAge equal to YrSold - YearBuilt
+
+```{r}
+# Change to numeric so we can do math
+all$YrSold <- as.numeric(as.character(all$YrSold))
+all$YearBuilt <- as.numeric(as.character(all$YearBuilt))
+all$YearRemodAdd <- as.numeric(as.character(all$YearRemodAdd))
+
+all <- all %>%
+  mutate(HouseAge = case_when(
+      YearRemodAdd == YearBuilt ~ YrSold - YearBuilt,
+      .default = YrSold - YearRemodAdd
+    ))
+```
+
+
+## Remodeled Yes/No Flag
+To go along with some houses being remodeled, it will be beneficial to have a variable that flags which houses have been remodeled.
+
+```{r}
+all <- all %>%
+  mutate(RemodeledFlag = case_when(
+      YearRemodAdd == YearBuilt ~ 'No',
+      .default = 'Yes'
+    ))
+all$RemodeledFlag <- as.factor(all$RemodeledFlag)
+```
+
+```{r}
+# Change back to factor
+all$YrSold <- as.factor(all$YrSold)
+```
+
+
+## Neighborhood
+
+```{r}
+nb1 <- ggplot(all[!is.na(all$SalePrice),], aes(x=reorder(Neighborhood, SalePrice, FUN=median), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') + labs(x='Neighborhood', y='Median SalePrice') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+nb2 <- ggplot(all[!is.na(all$SalePrice),], aes(x=reorder(Neighborhood, SalePrice, FUN=mean), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "mean", fill='blue') + labs(x='Neighborhood', y="Mean SalePrice") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #dashed line is median SalePrice
+grid.arrange(nb1, nb2)
+```
+There are three neighborhoods that clearly have a higher mean and median than the other neighborhoods. This is mirrored at the bottom of the range with the three poorest neighborhoods. I will bin these three into an ordinal factor.
+
+```{r}
+all$RichPoor[all$Neighborhood %in% c('StoneBr', 'NridgHt', 'NoRidge')] <- 2
+all$RichPoor[!all$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale', 'StoneBr', 'NridgHt', 'NoRidge')] <- 1
+all$RichPoor[all$Neighborhood %in% c('MeadowV', 'IDOTRR', 'BrDale')] <- 0
+
+table(all$RichPoor)
+```
+
+## Total Size
+
+There is no variable for the total square footage of the house. Let's create one which adds up the above ground and below ground square footage. 
+
+```{r}
+all$TotalSqFeet <- all$GrLivArea + all$TotalBsmtSF
+
+ggplot(data=all[!is.na(all$SalePrice),], aes(x=TotalSqFeet, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_text_repel(aes(label = ifelse(all$GrLivArea[!is.na(all$SalePrice)]>4500, rownames(all), '')))
+```
+There's two very clear outliers. I will deal with this in the next section.
+
+
+## Porches and Decks
+
+All of the porch and deck variables are split up and won't contribute much to the model by themselves, although I suspect they could add value if they were all added together.
+
+```{r}
+all$DeckPorch <- all$WoodDeckSF + all$OpenPorchSF + all$EnclosedPorch + all$X3SsnPorch + all$ScreenPorch
+
+ggplot(data=all[!is.na(all$SalePrice),], aes(x=DeckPorch, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+```
+
+
+# Prepare for Modeling
+
+## Dropping co-linear variables
+
+Some of the variables in the dataset are co-linear. I am dropping a variable if two variables are highly correlated. To find these correlated pairs, I have used the correlations matrix again (see section 6.1). For instance: GarageCars and GarageArea have a correlation of 0.89. Of those two, I am dropping the variable with the lowest correlation with SalePrice (which is GarageArea with a SalePrice correlation of 0.62. GarageCars has a SalePrice correlation of 0.64).
+
+```{r}
+dropVars <- c('YearRemodAdd', 'GarageYrBlt', 'GarageArea', 'GarageCond', 'TotalBsmtSF', 'TotalRmsAbvGrd', 'BsmtFinSF1')
+
+all <- all[,!(names(all) %in% dropVars)]
+```
+
+## Removing Outliers
+
+There are two huge houses that didn't sell for a lot of money. I will remove them from the dataset.
+
+```{r}
+all <- all[-c(524, 1299),]
+```
+
+
+## Normalize Variables
+
+
+Before modeling I need to center and scale the 'true numeric' predictors (so not variables that have been label encoded), and create dummy variables for the categorical predictors. Below, I am splitting the dataframe into one with all (true) numeric variables, and another dataframe holding the (ordinal) factors.
+
+```{r}
+numericVarNames <- numericVarNames[!(numericVarNames %in% c('MSSubClass', 'MoSold', 'YrSold', 'SalePrice', 'OverallQual', 'OverallCond'))] #numericVarNames was created before having done anything
+numericVarNames <- append(numericVarNames, c('HouseAge', 'DeckPorch', 'TotalBathrooms', 'TotalSqFeet'))
+
+DFnumeric <- all[, names(all) %in% numericVarNames]
+
+DFfactors <- all[, !(names(all) %in% numericVarNames)]
+DFfactors <- DFfactors[, names(DFfactors) != 'SalePrice']
+
+cat('There are', length(DFnumeric), 'numeric variables, and', length(DFfactors), 'factor variables')
+
+# str(DFnumeric)
+```
+
+**Skewness**
+Skewness is a measure of the symmetry in a distribution.  A symmetrical dataset will have a skewness equal to 0.  So, a normal distribution will have a skewness of 0. Skewness essentially measures the relative size of the two tails. As a rule of thumb, skewness should be between -1 and 1. In this range, data are considered fairly symmetrical. In order to fix the skewness, I am taking the log for all numeric predictors with an absolute skew greater than 0.8 (actually: log+1, to avoid division by zero issues).
+
+```{r}
+for(i in 1:ncol(DFnumeric)){
+        if (abs(skew(DFnumeric[,i]))>0.8){
+                DFnumeric[,i] <- log(DFnumeric[,i] +1)
+        }
+}
+```
+
+**Normalizing the data**
+```{r}
+PreNum <- preProcess(DFnumeric, method=c("center", "scale"))
+print(PreNum)
+
+
+DFnorm <- predict(PreNum, DFnumeric)
+dim(DFnorm)
+```
+
+## Create Dummy Variables
+
+In order to change the factor variables into numerical variables so the predictive model works correctly, I will create 'Dummy' variables for each factor.
+
+```{r}
+DFdummies <- as.data.frame(model.matrix(~.-1, DFfactors))
+dim(DFdummies)
+```
+
+
+## Remove variables with no/few Observations
+
+We should remove variables with no or few observations that will have little to no affect on the model.
+```{r}
+#check if some values are absent in the test set
+ZerocolTest <- which(colSums(DFdummies[(nrow(all[!is.na(all$SalePrice),])+1):nrow(all),])==0)
+colnames(DFdummies[ZerocolTest])
+DFdummies <- DFdummies[,-ZerocolTest] #removing predictors
+```
+
+```{r}
+#check if some values are absent in the train set
+ZerocolTrain <- which(colSums(DFdummies[1:nrow(all[!is.na(all$SalePrice),]),])==0)
+colnames(DFdummies[ZerocolTrain])
+DFdummies <- DFdummies[,-ZerocolTrain] #removing predictor
+```
+
+Also taking out variables with less than 10 'ones' in the train set.
+
+```{r}
+fewOnes <- which(colSums(DFdummies[1:nrow(all[!is.na(all$SalePrice),]),])<10)
+colnames(DFdummies[fewOnes])
+DFdummies <- DFdummies[,-fewOnes] #removing predictors
+dim(DFdummies)
+```
+
+Altogether, I have removed 49 one-hot encoded predictors with little or no variance.
+
+```{r}
+combined <- cbind(DFnorm, DFdummies) #combining all (now numeric) predictors into one dataframe 
+```
+
+
+## SalePrice Skewness
+
+```{r}
+skew(all$SalePrice)
+```
+
+```{r}
+qqnorm(all$SalePrice)
+qqline(all$SalePrice)
+```
+
+The skew of 1.87 indicates a right skew that is too high, and the Q-Q plot shows that sale prices are also not normally distributed. To fix this I am taking the log of SalePrice.
+
+```{r}
+all$SalePrice <- log(all$SalePrice) #default is the natural logarithm, "+1" is not necessary as there are no 0's
+skew(all$SalePrice)
+```
+
+As you can see,the skew is now quite low and the Q-Q plot is also looking much better.
+
+```{r}
+qqnorm(all$SalePrice)
+qqline(all$SalePrice)
+```
+
+
+
+## Create Train/Test
+
+```{r}
+train1 <- combined[!is.na(all$SalePrice),]
+test1 <- combined[is.na(all$SalePrice),]
+```
+
+
+
+
+# Modeling - XGBoost
+
+```{r}
+xgb_grid = expand.grid(
+nrounds = 1000,
+eta = c(0.1, 0.05, 0.01),
+max_depth = c(2, 3, 4, 5, 6),
+gamma = 0,
+colsample_bytree=1,
+min_child_weight=c(1, 2, 3, 4 ,5),
+subsample=1
+)
+```
+
+The next step is to let caret find the best hyperparameter values (using 5 fold cross validation).
+
+```{r}
+# set.seed(7)
+# my_control <-trainControl(method="cv", number=5)
+# 
+# xgb_caret <- train(x=train1, y=all$SalePrice[!is.na(all$SalePrice)], method='xgbTree', trControl= my_control, tuneGrid=xgb_grid) 
+# xgb_caret$bestTune
+```
+
+As expected, this took quite a bit of time (locally). In case you are running yourself I disabled the code, and am just continuing with the results. According to caret, the 'bestTune' parameters are:
+
+* Max_depth = 2
+* eta = 0.05
+* Min_child_weight = 3
+* gamma = 0
+
+Below, I am starting with the preparation of the data in the recommended format.
+
+```{r}
+label_train <- all$SalePrice[!is.na(all$SalePrice)]
+
+# put our testing & training data into two seperate Dmatrixs objects
+dtrain <- xgb.DMatrix(data = as.matrix(train1), label= label_train)
+dtest <- xgb.DMatrix(data = as.matrix(test1))
+```
+
+In addition, I am taking over the best tuned values from the caret cross validation.
+
+```{r}
+default_param<-list(
+        objective = "reg:linear",
+        booster = "gbtree",
+        eta=0.05, #default = 0.3
+        gamma=0,
+        max_depth=2, #default=6
+        min_child_weight=3, #default=1
+        subsample=1,
+        colsample_bytree=1
+)
+```
+
+The next step is to do cross validation to determine the best number of rounds (for the given set of parameters). 
+
+```{r}
+xgbcv <- xgb.cv( params = default_param, data = dtrain, nrounds = 500, nfold = 5, showsd = T, stratified = T, print_every_n = 40, early_stopping_rounds = 10, maximize = F)
+```
+
+Although it was a bit of work, the hyperparameter tuning definitly paid of, as the cross validated RMSE improved considerably (from 0.1225 without the caret tuning, to 0.1177 in this version)!
+
+```{r}
+#train the model using the best iteration found by cross validation
+xgb_mod <- xgb.train(data = dtrain, params=default_param, nrounds = 475)
+```
+
+```{r}
+XGBpred <- predict(xgb_mod, dtest)
+predictions_XGB <- exp(XGBpred) #need to reverse the log to the real values
+head(predictions_XGB)
+```
+
+```{r, out.width="100%"}
+#view variable importance plot
+library(Ckmeans.1d.dp) #required for ggplot clustering
+mat <- xgb.importance (feature_names = colnames(train1),model = xgb_mod)
+xgb.ggplot.importance(importance_matrix = mat[1:20], rel_to_first = TRUE)
+```
+
+# Final Predictions
+
+
+```{r}
+sub_avg <- data.frame(Id = test_labels, SalePrice = round(predictions_XGB, 3))
+head(sub_avg)
+write.csv(sub_avg, file = 'final_predictions.csv', row.names = F)
+```
+
